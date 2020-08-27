@@ -1,0 +1,54 @@
+# -*- mode: makefile -*-
+include ../../pkgs.mk
+
+CFLAGS = -I$(CURDIR)/../../duoauthproxy-build/usr/local/openssl/include -O2 -Wall -fstack-protector --param=ssp-buffer-size=4 -D_FORTIFY_SOURCE=2 -fomit-frame-pointer -fPIC
+LDFLAGS = -Wl,-z,relro -Wl,-z,now -Wl,-rpath='\$$\$$ORIGIN/../openssl/lib'
+
+# only enable PIE on x86_64 and only for the interpreter
+ifeq ($(shell uname -s),Linux)
+ifeq ($(shell uname -m),x86_64)
+CFLAGSFORSHARED = -fPIC
+LINKFORSHARED = -Xlinker -export-dynamic -pie
+endif
+endif
+
+.PHONY: all clean distclean install test
+
+all: Makefile .regen
+	$(MAKE)
+
+.regen:
+	touch .regen
+	find . -exec touch {} \;
+
+Makefile config.status: .regen
+	OPT="" CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" \
+	LINKFORSHARED="$(LINKFORSHARED)" CFLAGSFORSHARED="$(CFLAGSFORSHARED)" \
+	./configure \
+		--with-threads --enable-unicode=ucs4 \
+		--with-system-ffi \
+		--with-openssl=$(INSTALL_DIR)/usr/local/openssl \
+		--without-ensurepip
+
+distclean clean:
+	rm -f *.pyc *.pyo *~
+	rm -f .regen
+	$(MAKE) distclean
+	rm -f Makefile
+	rm -f Makefile.pre
+	rm -f config.status
+
+install: $(INSTALL_DIR)/usr/local/bin/python
+reinstall:
+	if [ ! -f "$(INSTALL_DIR)/usr/local/bin/python" ]; then \
+		$(MAKE) -f Makefile.duo install; \
+	fi
+
+$(INSTALL_DIR)/usr/local/bin/python: $(INSTALL_DIR) Makefile
+	env DESTDIR=$(INSTALL_DIR) $(MAKE) install
+
+$(INSTALL_DIR):
+	mkdir -p $(INSTALL_DIR)
+
+none:
+	# This rule has been intentionally left empty

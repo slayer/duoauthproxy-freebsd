@@ -1,0 +1,970 @@
+#!/usr/bin/env sh
+"exec" "`dirname $0`/usr/local/bin/python3.8" "$0" "$@"
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+from __future__ import print_function
+import os
+import os.path
+import stat
+import grp
+import pwd
+import shutil
+import subprocess
+import sys
+import optparse
+
+PRODUCT_NAME = 'duoauthproxy'
+
+SYSVINIT_DUO_SCRIPT_PATH = '/etc/init.d/duoauthproxy'
+SYSTEMD_DUO_SCRIPT_PATH = '/etc/systemd/system/duoauthproxy.service'
+OLD_SYSTEMD_DUO_SCRIPT_PATH = '/lib/systemd/system/duoauthproxy.service'
+
+# File modes
+ALL_READ_WRITE_NO_EXECUTE = 0o644
+ALL_READ_WRITE_EXECUTE = 0o755
+
+# Traditional sysvinit-style init.d script for Red Hat-style systems
+INITSCRIPT_REDHAT_TMPL = """\
+#!/bin/sh
+#
+#  Startup script for Duo Auth Proxy
+#
+#  chkconfig: 2345 85 15
+#  description: Start-up script for Duo Auth Proxy.
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+authproxyctl=%(install_dir)s/bin/authproxyctl
+
+. /etc/init.d/functions
+
+#  check for required files
+if [ ! -x $authproxyctl ]
+then
+    echo "$0: Aborting, no %(install_dir)s/bin/authproxyctl found"
+    exit 0
+fi
+
+case "$1" in
+    start)
+        $authproxyctl status > /dev/null 2>&1
+        if [ $? -ne 0 ]; then
+            echo -n "Starting duoauthproxy: "
+            $authproxyctl start && success || failure
+            echo
+        fi
+        ;;
+
+    stop)
+        $authproxyctl status > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            echo -n "Stopping duoauthproxy: "
+            $authproxyctl stop && success || failure
+            echo
+        fi
+        ;;
+
+    restart)
+        "${0}" stop
+        "${0}" start
+        ;;
+
+    force-reload)
+        $0 restart
+        ;;
+
+    status)
+        $authproxyctl status
+        ;;
+
+    *)
+        echo "Usage: ${0} {start|stop|restart|force-reload|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
+"""
+
+# Traditional sysvinit-style init.d script for Debian-based systems
+INITSCRIPT_DEBIAN_TMPL = """\
+#!/bin/sh
+### BEGIN INIT INFO
+# Provides:          duoauthproxy
+# Required-Start:    $remote_fs $syslog
+# Required-Stop:     $remote_fs $syslog
+# Default-Start:     2 3 4 5
+# Default-Stop:      0 1 6
+# Short-Description: Duo Security Authentication Proxy
+### END INIT INFO
+
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+authproxyctl=%(install_dir)s/bin/authproxyctl
+
+#  check for required files
+if [ ! -x $authproxyctl ]
+then
+    echo "$0: Aborting, no %(install_dir)s/bin/authproxyctl found"
+    exit 0
+fi
+
+. /lib/lsb/init-functions
+
+case "$1" in
+    start)
+        log_daemon_msg "Starting duoauthproxy" "twistd"
+        if $authproxyctl start; then
+            log_end_msg 0
+        else
+            log_end_msg 1
+        fi
+        ;;
+
+    stop)
+        log_daemon_msg "Stopping duoauthproxy" "twistd"
+        if $authproxyctl stop; then
+            log_end_msg 0
+        else
+            log_end_msg 1
+        fi
+        ;;
+
+    restart)
+        "${0}" stop
+        "${0}" start
+        ;;
+
+    force-reload)
+        $0 restart
+        ;;
+
+    status)
+        $authproxyctl status
+        ;;
+    *)
+        echo "Usage: ${0} {start|stop|restart|force-reload|status}" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
+"""
+
+# systemd-style service file to start/stop/restart/check status
+INITSCRIPT_SYSTEMD_TMPL = """
+[Unit]
+Description=Duo Security Authentication Proxy
+After=network.target
+
+[Service]
+Type=forking
+ExecStart=%(install_dir)s/bin/authproxyctl start
+ExecStop=%(install_dir)s/bin/authproxyctl stop
+StandardOutput=journal
+RemainAfterExit=true
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+UNINSTALL_SCRIPT_TMPL = """\
+#!/usr/bin/env sh
+"exec" "`dirname $0`/usr/local/bin/python3.8" "$0" "$@"
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+
+import os
+import os.path
+import shutil
+import subprocess
+import sys
+import argparse
+
+PRODUCT_NAME = 'duoauthproxy'
+
+class UninstallFailed(Exception):
+    pass
+
+class AuthproxyUninstaller(object):
+    def __init__(self):
+        self.inst_dir = %(install_dir)r
+
+    def uninstall(self, args):
+        if not args.no_prompt:
+            confirm = input('Uninstall Duo Security Authentication Proxy '
+                                'from \\'%%s\\'? [yes/no] ' %% self.inst_dir)
+            if confirm.lower() != 'yes':
+                raise UninstallFailed('User aborted uninstall process')
+
+        try:
+            self.stop_service()
+        except Exception as e:
+            raise UninstallFailed('Failed to stop proxy service: %%s' %% e)
+
+        try:
+            self.remove_initscript()
+        except Exception as e:
+            raise UninstallFailed('Failed to remove initscript: %%s' %% e)
+
+        try:
+            if self._primary_secret_storage_exists():
+                self._remove_primary_secret_storage()
+        except Exception as e:
+            raise UninstallFailed('Failed to remove primary secret: %%s' %% e)
+
+        try:
+            shutil.rmtree(self.inst_dir)
+        except Exception as e:
+            raise UninstallFailed('Failed to remove files: %%s' %% e)
+
+    def stop_service(self):
+        authproxyctl = os.path.join(self.inst_dir, 'bin', 'authproxyctl')
+        status = subprocess.call([authproxyctl, 'stop'])
+        if status:
+            raise Exception('authproxyctl failed with status %%d' %% status)
+
+    def remove_initscript(self):
+        if self._sysv_initscript_exists():
+            self._remove_initscript_sysvinit()
+
+        for initscript in ['/etc/systemd/system/duoauthproxy.service',
+                           '/lib/systemd/system/duoauthproxy.service']:
+            if self._systemd_initscript_exists(initscript):
+                self._remove_initscript_systemd(initscript)
+
+    def _sysv_initscript_exists(self):
+        path = '/etc/init.d/duoauthproxy'
+        return os.path.isfile(path)
+
+    def _systemd_initscript_exists(self, path):
+        return os.path.isfile(path)
+
+    def _old_systemd_initscript_exists(self):
+        path = '/lib/systemd/system/duoauthproxy.service'
+        return os.path.isfile(path)
+
+    def _remove_initscript_systemd(self, initscript_path):
+        if not os.path.isfile(initscript_path):
+            return
+        status = subprocess.call(['systemctl', 'disable', 'duoauthproxy.service'])
+        if status:
+            raise UpgradeFailed('systemctl failed to disable duoauthproxy.service: {0}'.format(status))
+        os.remove(initscript_path)
+        status = subprocess.call(['systemctl', 'daemon-reload'])
+        if status:
+            print("Warning: systemctl daemon-reload was unsuccessful: {0}".format(status))
+        status = subprocess.call(['systemctl', 'reset-failed'])
+        if status:
+            print("Warning: systemctl reset-failed was unsuccessful: {0}".format(status))
+
+    def _remove_initscript_sysvinit(self):
+        initscript_path = '/etc/init.d/duoauthproxy'
+        if not os.path.isfile(initscript_path):
+            return
+
+        if os.path.isfile('/sbin/chkconfig'):
+            status = subprocess.call(['/sbin/chkconfig', '--del',
+                                      'duoauthproxy'])
+            if status:
+                raise Exception('chkconfig failed with status %%d' %% status)
+            os.remove(initscript_path)
+        elif os.path.isfile('/etc/debian_version'):
+            os.remove(initscript_path)
+            status = subprocess.call(['/usr/sbin/update-rc.d', 'duoauthproxy',
+                                      'remove'])
+            if status:
+                raise Exception('update-rc.d failed with status %%d' %% status)
+
+    def _primary_secret_storage_exists(self):
+        return os.path.isfile('/etc/duoauthproxy/secrets')
+
+    def _remove_primary_secret_storage(sef):
+        os.remove('/etc/duoauthproxy/secrets')
+
+        try:
+            os.rmdir('/etc/duoauthproxy')
+        except Exception:
+            # only remove the directory if the secrets file was the only file
+            pass
+
+        return
+
+def main(argv):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--no-prompt', action="store_true", help="Uninstall without prompting")
+    args = parser.parse_args(argv[1:])
+    uninstaller = AuthproxyUninstaller()
+    try:
+        uninstaller.uninstall(args)
+        print('Uninstall Complete')
+        return 0
+    except UninstallFailed as e:
+        print("")
+        print('Uninstall Failed:')
+        print(repr(e))
+        print("")
+        return -1
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))
+"""
+
+
+# recursive chown.
+def chown_recursive(dst, uid, gid):
+    names = os.listdir(dst)
+
+    errors = []
+    for name in names:
+        dstname = os.path.join(dst, name)
+        try:
+            # change ownership. (maybe we should just shell out to chown...)
+            os.lchown(dstname, uid, gid)
+            if (os.path.isdir(dstname)
+                    and not os.path.islink(dstname)
+                    and not os.path.ismount(dstname)):
+                # recurse
+                chown_recursive(dstname, uid, gid)
+        # catch the Error from the recursive chown so that we can
+        # continue with other files
+        except shutil.Error as err:
+            errors.extend(err.args[0])
+        except (IOError, os.error) as why:
+            errors.append((dstname, str(why)))
+    if errors:
+        raise shutil.Error(errors)
+
+
+def is_redhat():
+    # Returns True for RHEL and RHEL-like systems like CentOS
+    return os.path.isfile('/sbin/chkconfig')
+
+
+def is_debian():
+    return os.path.isfile('/etc/debian_version')
+
+
+def is_systemd():
+    """
+    In systemd-enabled OSes, ps -p 1 should return systemd as the running process
+    of PID 1, while PID 1 might be bash or init on other init systems.
+
+    check_output is not used here to keep compatibility with python2.6.
+    """
+    proc = subprocess.Popen(
+        ['ps', '-p', '1', '-o', 'comm='],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    output, err = proc.communicate()
+    if err:
+        print("Warning: ps failed to detect init system: {0}\n".format(err))
+    return 'systemd' in output
+
+
+def sysv_initscript_exists():
+    # Checks if sysvinit-style authproxy init script exists
+    path = SYSVINIT_DUO_SCRIPT_PATH
+    return os.path.isfile(path)
+
+
+def systemd_initscript_exists():
+    path = SYSTEMD_DUO_SCRIPT_PATH
+    return os.path.isfile(path)
+
+
+def old_systemd_initscript_exists():
+    path = OLD_SYSTEMD_DUO_SCRIPT_PATH
+    return os.path.isfile(path)
+
+
+class InstallFailed(Exception):
+    pass
+
+
+class UpgradeFailed(Exception):
+    pass
+
+
+class AuthproxyUpgradeManager(object):
+    """Manages the upgrade part of an upgrade installation.
+    Saves the existing installation to the side, so that a clean
+    installation can procede, then restores config and log
+    files from the old installation."""
+
+    def __init__(self, install_dir, service_uid, log_group_gid):
+        self.inst_dir = install_dir
+        self.service_uid = service_uid
+        self.log_group_gid = log_group_gid
+
+        self.inst_dir_old = None
+
+    def start(self):
+        """Prepares an upgrade installation, if required."""
+        if os.path.exists(self.inst_dir):
+            print("")
+            print("Preparing for upgrade installation...")
+            self.inst_dir_old = self.make_backup_dir_name()
+            self.teardown_service()
+            self.save_old_files()
+
+    def finish(self):
+        """Finishes an upgrade installation, if one was started."""
+        if self.inst_dir_old:
+            self.restore_conf_and_logs()
+            try:
+                print("Removing old installation...")
+                shutil.rmtree(self.inst_dir_old)
+            except Exception as e:
+                raise UpgradeFailed('Could not delete old files: %s' % e)
+            print("Upgrade complete.")
+
+    def make_backup_dir_name(self):
+        """Returns an unused dirctory name resembling
+        self.inst_dir."""
+        i = 1
+        while True:
+            pth = self.inst_dir + ".%s" % i
+            if not os.path.exists(pth):
+                return pth
+            i += 1
+
+    def teardown_service(self):
+        try:
+            self.stop_service()
+        except Exception as e:
+            raise UpgradeFailed('Failed to stop proxy service: %s' % e)
+
+        try:
+            self.remove_initscript()
+        except Exception as e:
+            raise UpgradeFailed('Failed to remove initscript: %s' % e)
+
+    def save_old_files(self):
+        try:
+            # remove everything except the conf and log directories
+            print("Preserving old installation...")
+            shutil.move(self.inst_dir, self.inst_dir_old)
+        except Exception as e:
+            raise UpgradeFailed('Failed to store files: %s' % e)
+
+    def restore_conf_and_logs(self):
+        print("")
+        print("Applying config and logs from old installation...")
+        try:
+            self._iterate_directories([('conf', ['ca-bundle.crt'])])
+            self._iterate_directories([('log', [])], self.log_group_gid)
+        except Exception as e:
+            raise UpgradeFailed('Could not restore conf and log files: %s' % e)
+
+    def _iterate_directories(self, dirs_to_restore, group_gid=0):
+        for (d, ignore) in dirs_to_restore:
+            dpth = os.path.join(self.inst_dir_old, d)
+            for filename in os.listdir(dpth):
+                if filename not in ignore:
+                    dst_fname = os.path.join(self.inst_dir, d, filename)
+                    shutil.copy2(os.path.join(dpth, filename), dst_fname)
+                    os.lchown(dst_fname, self.service_uid, group_gid)
+
+    def stop_service(self):
+        print("Stopping service...")
+        authproxyctl = os.path.join(self.inst_dir, 'bin', 'authproxyctl')
+        if os.path.exists(authproxyctl):
+            status = subprocess.call([authproxyctl, 'stop'])
+            if status:
+                raise UpgradeFailed('authproxyctl failed with status %d' % status)
+
+    def remove_initscript(self):
+        print("Removing initscript...")
+
+        if sysv_initscript_exists():
+            self._remove_sysv_initscript()
+
+        if systemd_initscript_exists():
+            self._remove_systemd_initscript(SYSTEMD_DUO_SCRIPT_PATH)
+
+        if old_systemd_initscript_exists():
+            self._remove_systemd_initscript(OLD_SYSTEMD_DUO_SCRIPT_PATH)
+
+    def _remove_sysv_initscript(self):
+        if is_redhat():
+            status = subprocess.call(['/sbin/chkconfig', '--del',
+                                      'duoauthproxy'])
+            if status:
+                raise UpgradeFailed('chkconfig failed with status %d' % status)
+            os.remove(SYSVINIT_DUO_SCRIPT_PATH)
+        elif is_debian():
+            os.remove(SYSVINIT_DUO_SCRIPT_PATH)
+            status = subprocess.call(['/usr/sbin/update-rc.d', 'duoauthproxy',
+                                      'remove'])
+            if status:
+                raise UpgradeFailed('update-rc.d failed with status %d' % status)
+
+    def _remove_systemd_initscript(self, path):
+        status = subprocess.call(['systemctl', 'disable', 'duoauthproxy.service'])
+        if status:
+            raise UpgradeFailed('systemctl failed to disable duoauthproxy.service: {0}'.format(status))
+        os.remove(path)
+        status = subprocess.call(['systemctl', 'daemon-reload'])
+        if status:
+            print("Warning: systemctl daemon-reload was unsuccessful: {0}".format(status))
+        status = subprocess.call(['systemctl', 'reset-failed'])
+        if status:
+            print("Warning: systemctl reset-failed was unsuccessful: {0}".format(status))
+
+
+class AuthproxyInstaller(object):
+    INSTALL_DIR_DEFAULT = os.path.join('/opt', PRODUCT_NAME)
+    USER_DEFAULT = 'duo_authproxy_svc'
+    GROUP_DEFAULT = 'duo_authproxy_grp'
+
+    def __init__(self, install_dir=None, service_user=None, log_group=None, do_initscript=None):
+        self.install_dir = install_dir
+        self.service_user = service_user
+        self.service_uid = None
+        self.log_group = log_group
+        self.log_group_gid = None
+        self.do_initscript = do_initscript
+        self.src_dir = os.path.dirname(os.path.abspath(__file__))
+
+    @property
+    def script_params(self):
+        return {'service_user': self.service_user,
+                'log_group': self.log_group,
+                'install_dir': self.install_dir}
+
+    def is_upgrade(self):
+        return os.path.exists(self.install_dir)
+
+    def install(self):
+        # user interaction
+        self.get_install_dir()
+        self.get_user()
+        self.get_group()
+
+        # check for uninstall
+        upgrader = AuthproxyUpgradeManager(self.install_dir, self.service_uid, self.log_group_gid)
+        upgrader.start()
+
+        # install
+        print("")
+        print('Copying files...', end=" ")
+        self.copy_files()
+        self.set_ownership()
+        print('Done.')
+
+        # post-install
+        print("")
+        # Fix up shebangs for executbles to point to the install directory python instead of the local build python
+        python_executables = ['python', 'python3.8', 'python3']
+        python_bin = os.path.join(self.install_dir, 'usr', 'local', 'bin')
+        authproxy_bin = os.path.join(self.install_dir, 'bin')
+        for filename in os.listdir(python_bin):
+            if filename not in python_executables:
+                self.replace_shebang(filename, python_bin)
+
+        self.customize_script('authproxyctl', python_bin)
+        self.customize_script('authproxy_update_sso_enrollment_code', python_bin)
+        self.customize_script('duoauthproxy.tap', authproxy_bin)
+
+        # Symlink user facing scripts to install_dir/bin for backwards compatability
+        os.symlink(os.path.join(python_bin, 'authproxy'), os.path.join(authproxy_bin, 'authproxy'))
+        os.symlink(os.path.join(python_bin, 'authproxyctl'), os.path.join(authproxy_bin, 'authproxyctl'))
+        os.symlink(os.path.join(python_bin, 'authproxy_connectivity_tool'),
+                   os.path.join(authproxy_bin, 'authproxy_connectivity_tool'))
+        os.symlink(os.path.join(python_bin, 'authproxy_primary_only'),
+                   os.path.join(authproxy_bin, 'authproxy_primary_only'))
+        os.symlink(os.path.join(python_bin, 'authproxy_support'), os.path.join(authproxy_bin, 'authproxy_support'))
+        os.symlink(os.path.join(python_bin, 'authproxy_update_sso_enrollment_code'),
+                   os.path.join(authproxy_bin, 'authproxy_update_sso_enrollment_code'))
+
+        self.create_initscript()
+        self.create_uninstaller()
+
+        upgrader.finish()
+
+        # done!
+        print("")
+        print('Installation completed. Before starting the Authentication Proxy, ')
+        print('Please edit the configuration file at:')
+        print("")
+        print(self.config_path)
+        print("")
+
+    def get_group(self):
+        if self.log_group:
+            # Gary is doing a scripted install so we already have a username.
+            if self.log_group == self.GROUP_DEFAULT and not self._group_exists(self.log_group):
+                self._create_default_group()
+
+            self._set_group(self.log_group)
+            return
+
+        while True:
+            print("")
+            print('Enter the name of a group under which the '
+                  'Authentication Proxy logs will be readable. Or press <Enter> and '
+                  'a default group will be created for you:')
+            gname = input('[%s] ' % self.GROUP_DEFAULT).strip() or self.GROUP_DEFAULT
+
+            if gname == self.GROUP_DEFAULT and not self._group_exists(gname):
+                self._create_default_group()
+
+            try:
+                self._set_group(gname)
+            except InstallFailed:
+                # If group can't be found we will print an error and then reprompt for a new group
+                print('No such group: \'%s\'' % gname)
+            else:
+                return
+
+    def _create_default_group(self):
+        retcode = subprocess.call(["groupadd", "-r", self.GROUP_DEFAULT])
+        if retcode != 0:
+            raise InstallFailed("Unable to create group {}".format(self.GROUP_DEFAULT))
+
+    def _set_group(self, groupname):
+        try:
+            row = grp.getgrnam(groupname)
+        except KeyError:
+            raise InstallFailed('No such group: \'%s\''
+                                % groupname)
+        else:
+            self.log_group = groupname
+            self.log_group_gid = row.gr_gid
+
+    def _group_exists(self, groupname):
+        try:
+            grp.getgrnam(groupname)
+        except KeyError:
+            return False
+        else:
+            return True
+
+    def get_user(self):
+        if self.service_user:
+            # Gary is doing a scripted install so we already have a username.
+            if self.service_user == self.USER_DEFAULT and not self._user_exists(self.service_user):
+                self._create_default_service_user()
+
+            self._set_user_as_service_user(self.service_user)
+            return
+
+        # otherwise, we need to do a prompt.
+        while True:
+            print("")
+            print('Enter the name of a user account under which the '
+                  'Authentication Proxy should be run. We recommend a non-privileged and locked down account.\n'
+                  'Or you can press <Enter> and our default locked down user will be created for you:')
+            uname = input('[%s] ' % self.USER_DEFAULT).strip() or self.USER_DEFAULT
+
+            if uname == self.USER_DEFAULT and not self._user_exists(uname):
+                self._create_default_service_user()
+
+            try:
+                self._set_user_as_service_user(uname)
+            except InstallFailed:
+                # If user can't be found we will print an error and then reprompt for a new user
+                print('No such user: \'%s\'' % uname)
+            else:
+                return
+
+    def _set_user_as_service_user(self, username):
+        try:
+            row = pwd.getpwnam(username)
+        except KeyError:
+            raise InstallFailed('No such user: \'%s\''
+                                % self.service_user)
+        else:
+            self.service_user = username
+            self.service_uid = row.pw_uid
+
+    def _create_default_service_user(self):
+        retcode = subprocess.call(["useradd", "-r", "-s", "/bin/nologin", self.USER_DEFAULT])
+        if retcode != 0:
+            raise InstallFailed("Unable to create user {}".format(self.USER_DEFAULT))
+
+    def _user_exists(self, username):
+        try:
+            pwd.getpwnam(username)
+        except KeyError:
+            return False
+        else:
+            return True
+
+    def get_install_dir(self):
+        if self.install_dir is None:
+            # get install directory from user
+            print("")
+            print('In what directory do you wish to install the '
+                  'Duo Authentication Proxy?')
+
+            provided_install_dir = input('[%s] ' % self.INSTALL_DIR_DEFAULT)
+            self.install_dir = provided_install_dir.strip() or self.INSTALL_DIR_DEFAULT
+        self.config_path = os.path.join(self.install_dir,
+                                        'conf',
+                                        'authproxy.cfg')
+
+    def copy_files(self):
+        try:
+            # copy files - specifically, copy everything except this script itself
+            def ignore_fcn(src, names):
+                files_to_ignore = []
+                basename = os.path.basename(__file__)
+                if basename in names:
+                    abspath = os.path.abspath(os.path.join(src, basename))
+                    if abspath == os.path.abspath(__file__):
+                        files_to_ignore.append(basename)
+                # ignore the local directory created by virtualenv in Python 2.7.6
+                # it contains symlinks that point back to the source dir and wreak havoc on authproxy startup
+                if ('local' in names
+                        and os.path.isdir(os.path.join(src, 'local'))
+                        and os.path.basename(src) == 'duoauthproxy-build'):
+                    files_to_ignore.append('local')
+                return files_to_ignore
+
+            shutil.copytree(self.src_dir, self.install_dir, symlinks=False,
+                            ignore=ignore_fcn)
+        except Exception as e:
+            raise InstallFailed('Error while copying files: %s' % e)
+
+    def set_ownership(self):
+        # set ownership
+        try:
+            # change ownership of the whole install to root
+            chown_recursive(self.install_dir, 0, 0)
+
+            # change ownership of 'log' directory, 'run' directory,
+            # and config file to the specified user.
+            if (self.service_uid != 0):
+                os.lchown(os.path.join(self.install_dir, 'log'),
+                          self.service_uid, 0)
+                os.lchown(os.path.join(self.install_dir, 'run'),
+                          self.service_uid, 0)
+                os.lchown(self.config_path,
+                          self.service_uid, 0)
+            # limit readability of config file
+            os.chmod(self.config_path, 0o640)
+
+            # set group id on the log directory in order to have any
+            # new files inherit the group id. we need to use constants
+            # because the chmod python package does not convert special
+            # bits like SGID so 2640 does not work.
+            if self.log_group_gid:
+                os.chmod(os.path.join(self.install_dir, 'log'),
+                         stat.S_ISGID | stat.S_IRUSR | stat.S_IWUSR | stat.S_IXUSR | stat.S_IRGRP | stat.S_IXGRP)
+                os.lchown(os.path.join(self.install_dir, 'log'),
+                          self.service_uid, self.log_group_gid)
+
+        except Exception as e:
+            raise InstallFailed('Error setting file permissions: %s' % e)
+
+    def read_script(self, filename, directory):
+        script = os.path.join(directory, filename)
+        try:
+            with open(script, 'rb') as fp:
+                try:
+                    lines = fp.read().decode('utf-8').splitlines()
+                except UnicodeDecodeError:
+                    # This is probably a binary program instead
+                    # of a script, so just ignore it.
+                    return []
+            return lines
+        except IOError as e:
+            raise InstallFailed('Error editing {0} script: {1}', filename, e)
+
+    def write_script(self, filename, directory, lines):
+        """Write the give lines back to the file
+        Args:
+            filename: (str)
+            directory: (str)
+            lines = [(str)]
+        """
+        script = os.path.join(directory, filename)
+        try:
+            with open(script, 'wb') as fp:
+                fp.write('\n'.join(lines).encode('utf-8'))
+                fp.write('\n'.encode('utf-8'))
+        except IOError as e:
+            raise InstallFailed('Error editing {0} script: {1}', filename, e)
+
+    def replace_shebang(self, filename, directory):
+        new_shebang = "#!%(install_dir)s/usr/local/bin/python3" % self.script_params
+        lines = self.read_script(filename, directory)
+        if not lines:
+            # Script was empty or failed to be read
+            return
+        if lines[0].startswith("#!") and 'python' in lines[0]:
+            # We found a shebang so let's replace it with our installed python
+            lines[0] = new_shebang
+        self.write_script(filename, directory, lines)
+
+    def customize_script(self, filename, directory):
+        REWRITE_START = '# --- install script will customize this ---'
+        REWRITE_END = '# ------------------------------------------'
+        REWRITE_LINES = {
+            'USER_DEFAULT = None': 'USER_DEFAULT = %(service_user)r',
+            'GROUP_DEFAULT = None': 'GROUP_DEFAULT = %(log_group)r',
+        }
+        lines = self.read_script(filename, directory)
+        if not lines:
+            raise InstallFailed('Error editing {0} script. File was empty'.format(filename))
+        rewrite = False
+        new_script_lines = []
+        for line in lines:
+            if line == REWRITE_START:
+                rewrite = True
+            elif line == REWRITE_END:
+                rewrite = False
+            elif rewrite:
+                rewrite_line = REWRITE_LINES.get(line)
+                if rewrite_line is not None:
+                    new_script_lines.append(rewrite_line % self.script_params)
+                else:
+                    new_script_lines.append(line)
+            else:
+                new_script_lines.append(line)
+        self.write_script(filename, directory, new_script_lines)
+
+    def create_initscript(self):
+        # See if it would be possible to create an init script
+        create_func = None
+        try:
+            if is_systemd():
+                create_func = self.create_initscript_systemd
+            elif is_debian():
+                create_func = self.create_initscript_debian
+            elif is_redhat():
+                create_func = self.create_initscript_redhat
+        except Exception as e:
+            print("Failed to create the initialization script. Error:", e)
+
+        if not create_func:
+            print('Currently, this installer cannot create initialization '
+                  'scripts for your platform.')
+        else:
+            if self.do_initscript is None:
+                while True:
+                    response = input(
+                        'Create an initialization script to run the proxy upon '
+                        'startup? [Yes/no] ')
+                    if not response.lower() in ('yes', 'no', ''):
+                        print('Please enter \'yes\' or \'no\'')
+                    else:
+                        self.do_initscript = (response.lower() in ('yes', ''))
+                        break
+
+            if self.do_initscript:
+                try:
+                    create_func()
+                    return True
+                except Exception as e:
+                    print('Error creating initialization script: %s' % e)
+        print("")
+        print('You may start/stop the Duo Authentication Proxy by running: ')
+        print('# %s/bin/authproxyctl {start|stop|restart}' % self.install_dir)
+        return False
+
+    def create_initscript_systemd(self):
+        """
+        Creates duoauthproxy.service on systemd-enabled OSes regardless of distro.
+        systemd will complain repeatedly if you set your service files as executable,
+        hence the 644 (no executable bits) as opposed to 755.
+        """
+        service_script = INITSCRIPT_SYSTEMD_TMPL % self.script_params
+        with open(SYSTEMD_DUO_SCRIPT_PATH, 'w') as initfile:
+            initfile.write(service_script)
+            os.fchmod(initfile.fileno(), ALL_READ_WRITE_NO_EXECUTE)
+            os.fchown(initfile.fileno(), 0, 0)
+        status = subprocess.call(['systemctl', 'daemon-reload'])
+        if status:
+            raise Exception("systemctl was unable to add the duoauthproxy service file: status {0}".format(status))
+        status = subprocess.call(['systemctl', 'enable', 'duoauthproxy.service'])
+        print("Created service script at {0}".format(SYSTEMD_DUO_SCRIPT_PATH))
+
+    def create_initscript_redhat(self):
+        init_script = INITSCRIPT_REDHAT_TMPL % self.script_params
+        with open(SYSVINIT_DUO_SCRIPT_PATH, 'w') as initfile:
+            initfile.write(init_script)
+            os.fchmod(initfile.fileno(), ALL_READ_WRITE_EXECUTE)
+            os.fchown(initfile.fileno(), 0, 0)
+        status = subprocess.call(['/sbin/chkconfig', '--add', 'duoauthproxy'])
+        if status:
+            raise Exception('chkconfig failed with status %d' % status)
+        print("Created init script at {0}\n".format(SYSVINIT_DUO_SCRIPT_PATH))
+
+    def create_initscript_debian(self):
+        init_script = INITSCRIPT_DEBIAN_TMPL % self.script_params
+        with open(SYSVINIT_DUO_SCRIPT_PATH, 'w') as initfile:
+            initfile.write(init_script)
+            os.fchmod(initfile.fileno(), ALL_READ_WRITE_EXECUTE)
+            os.fchown(initfile.fileno(), 0, 0)
+        status = subprocess.call(['/usr/sbin/update-rc.d', 'duoauthproxy',
+                                  'defaults'])
+        if status:
+            raise Exception('update-rc.d failed with status %d' % status)
+        print("Created init script at {0}\n".format(SYSVINIT_DUO_SCRIPT_PATH))
+
+    def create_uninstaller(self):
+        try:
+            uninstall_script = UNINSTALL_SCRIPT_TMPL % self.script_params
+            uninstall_script_path = os.path.join(self.install_dir, 'uninstall')
+            with open(uninstall_script_path, 'w') as uninstfile:
+                uninstfile.write(uninstall_script)
+                os.fchmod(uninstfile.fileno(), ALL_READ_WRITE_EXECUTE)
+                os.fchown(uninstfile.fileno(), 0, 0)
+        except Exception as e:
+            print('Failed to create uninstall script: %s' % e)
+
+
+def main(argv):
+    parser = optparse.OptionParser()
+    parser.add_option('--install-dir', default=None,
+                      help='(The directory to where you want to install the authentication proxy. Recommendation: \'/opt/duoauthproxy\' Default: prompt)')
+    parser.add_option('--service-user', default=None,
+                      help='(The name of the user account under which the Authentication Proxy should run. Recommendation: \'duo_authproxy_svc\' Default: prompt)')
+    parser.add_option('--log-group', default=None,
+                      help='(The name of the group under which the Authentication Proxy logs can be read. Recommendation: \'duo_authproxy_grp\' Default: prompt)')
+    parser.add_option('--silent', action='store_true', help="Don't prompt for values, use defaults")
+    parser.add_option('--create-init-script', choices=['yes', 'no'], default=None,
+                      help='(Create an initialization script to run the proxy upon startup. Choices: [yes/no]) Default: prompt')
+
+    (options, args) = parser.parse_args()
+
+    do_initscript = None
+    if options.create_init_script:
+        do_initscript = (options.create_init_script == 'yes')
+
+    if options.silent:
+        if options.service_user is None:
+            options.service_user = AuthproxyInstaller.USER_DEFAULT
+        if options.install_dir is None:
+            options.install_dir = AuthproxyInstaller.INSTALL_DIR_DEFAULT
+        if options.log_group is None:
+            options.log_group = AuthproxyInstaller.GROUP_DEFAULT
+        if options.create_init_script is None:
+            do_initscript = True
+
+    installer = AuthproxyInstaller(
+        install_dir=options.install_dir,
+        service_user=options.service_user,
+        log_group=options.log_group,
+        do_initscript=do_initscript
+    )
+    try:
+        installer.install()
+        return 0
+    except InstallFailed as e:
+        print("")
+        print('Installation Failed:')
+        print(repr(e))
+        print("")
+        return -1
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

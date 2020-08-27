@@ -1,0 +1,23 @@
+#!/root/duoauthproxy-5.0.0-b03e68d-src/duoauthproxy-build/usr/local/bin/python3
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+
+import sys
+
+from twisted.application import app
+from twisted.internet import reactor
+
+from duoauthproxy import proxy
+
+if len(sys.argv) > 1 and sys.argv[1] == "--version":
+    version = proxy.get_version()
+    if not version:
+        version = "Unknown Version"
+    print("Duo Security Authentication Proxy -", version, file=sys.stderr)
+    sys.exit(0)
+
+application = proxy.create_application(args=sys.argv)
+app.startApplication(application, 0)
+reactor.run()

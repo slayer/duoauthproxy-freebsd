@@ -1,0 +1,8 @@
+-e .
+
+# DUO EDIT D46269: Remove dependency on passlib
+# passlib
+# END EDIT
+pyparsing
+twisted[tls]
+zope.interface

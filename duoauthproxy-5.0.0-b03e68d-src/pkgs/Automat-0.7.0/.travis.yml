@@ -1,0 +1,43 @@
+language: python
+matrix:
+  include:
+    - python: 2.7
+      env: TOX_ENV=py27-extras
+    - python: 2.7
+      env: TOX_ENV=py27-noextras
+
+    - python: pypy
+      env: TOX_ENV=pypy-extras
+    - python: pypy
+      env: TOX_ENV=pypy-noextras
+
+#    - python: 3.3
+#      env: TOX_ENV=py33-extras
+#    - python: 3.3
+#      env: TOX_ENV=py33-noextras
+
+    - python: 3.4
+      env: TOX_ENV=py34-extras
+    - python: 3.4
+      env: TOX_ENV=py34-noextras
+
+    - python: 3.5
+      env: TOX_ENV=py35-extras
+    - python: 3.5
+      env: TOX_ENV=py35-noextras
+
+    - python: 3.6
+      env: TOX_ENV=py36-extras
+    - python: 3.6
+      env: TOX_ENV=py36-noextras
+
+install:
+    - sudo apt-get install graphviz
+    - pip install tox coveralls
+
+script:
+    - tox -e $TOX_ENV
+
+after_success:
+    - tox -e coverage-report
+    - coveralls

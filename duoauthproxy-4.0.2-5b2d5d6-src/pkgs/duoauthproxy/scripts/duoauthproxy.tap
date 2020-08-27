@@ -1,0 +1,8 @@
+from duoauthproxy import proxy
+
+# --- install script will customize this ---
+USER_DEFAULT = None
+GROUP_DEFAULT = None
+# ------------------------------------------
+
+application = proxy.create_application(twistd_user=USER_DEFAULT, log_group=GROUP_DEFAULT)

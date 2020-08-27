@@ -1,0 +1,82 @@
+#!/usr/bin/env python
+# encoding: utf-8
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+
+import os
+import sys
+import getpass
+import argparse
+
+from duoauthproxy.lib import protect
+from duoauthproxy.lib import util
+from duoauthproxy.lib import config_provider
+
+
+def okay_to_overwrite(overwrite_flag):
+    """ Determine if it's okay to overwrite comments in the config file.
+    If the config flag is passed overwrite silently without user input. If not, prompt to verify.
+    """
+    if overwrite_flag:
+        return True
+    else:
+        while True:
+            response = input(
+                'Utilizing the feature to encrypt the entire configuration will overwrite any non critical modifications to your configuration file such as comments. Are you sure you want to proceed? [Yes/no] '
+            ).lower()
+            if response not in ('yes', 'no', ''):
+                print('Please enter \'yes\' or \'no\'')
+            elif response in ('yes', ''):
+                return True
+            else:
+                return False
+
+
+def encrypt_config_file():
+    """ Open the configuration file, replace all encryptable values with the encrypted version, and save it back down"""
+    home_dir = util.get_home_dir()
+    os.chdir(home_dir)
+
+    configuration = config_provider.get_config(apply_overrides=False)
+    configuration.encrypt_all_values()
+
+    config_filename = os.path.join(home_dir, 'conf', 'authproxy.cfg')
+    configuration.write_ini_file(config_filename)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Duo Security Authentication Proxy Password Encryption Tool. This tool will take in individual passwords to be encrypted or it can be pointed at a configuration file and encrypt all the fields.')
+    parser.add_argument('--whole-config', dest='whole_config', action='store_true', default=False,
+                        help='( Reads through the entire configuration file and encrypts all possible fields. Default: prompt for individual passwords)')
+
+    parser.add_argument('--yes-overwrite', dest='overwrite_config', action='store_true', default=False,
+                        help='( Allows the tool to write back to the configuration file with the new encrypted values. This will destroy any comments. Default: yes/no prompt explaining the risk. No means the command will abort)')
+
+    parser.add_argument('password', nargs='?', default='')
+
+    args = parser.parse_args()
+
+    if args.whole_config:
+        if okay_to_overwrite(args.overwrite_config):
+            encrypt_config_file()
+        else:
+            print("Aborting encryption of config file due to user input.")
+        return
+
+    if not args.password:
+        print("Please provide your secret to encrypt.")
+        password = getpass.getpass("Password:")
+        password2 = getpass.getpass("Re-enter password:")
+        if password != password2:
+            print("Passwords do not match")
+            return
+    else:
+        password = sys.argv[1]
+    protected_pw = protect.protect(password)
+    print(protected_pw)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,226 @@
+#!/usr/bin/env python2.6
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+
+from __future__ import print_function
+import os
+import os.path
+import signal
+import subprocess
+import sys
+import time
+
+from duoauthproxy import proxy
+
+# linux standard status codes for 'status' initscript command
+STATUS_RUNNING = 0
+STATUS_STALE_PIDFILE = 1
+STATUS_STOPPED = 3
+STATUS_UNKNOWN = 4
+
+# linux standard error codes for other initscript commands
+ERROR_NONE = 0
+ERROR_GENERIC = 1
+ERROR_ARGS = 2
+ERROR_UNIMPLEMENTED = 3
+
+# --- install script will customize this ---
+USER_DEFAULT = None
+# ------------------------------------------
+
+
+class AuthproxyController(object):
+    def __init__(self, python_root=None, duo_root=None, user=None):
+        # Follow symlinks and get the root of the bundled python and the authproxy
+        script_abspath = os.path.abspath(os.path.realpath(__file__))
+        if python_root is None:
+            root_relative = os.path.join(os.path.dirname(script_abspath), '..')
+            python_root = os.path.abspath(root_relative)
+
+        if duo_root is None:
+            root_relative = os.path.join(os.path.dirname(script_abspath), *['..'] * 3)
+            duo_root = os.path.abspath(root_relative)
+
+        self.python_root = python_root
+        self.duo_root = duo_root
+        # determine uid to which twistd should drop privileges
+        # if we were passed an argument, we use that
+        if user is None:
+            # otherwise fall back on the hardcoded default in this script
+            user = USER_DEFAULT
+
+        # if we have one, parse the user into a uid
+        self.uid = None
+        if user is not None:
+            self.uid, self.gid = proxy._parse_user(user)
+
+    @property
+    def pidfile(self):
+        return os.path.join(self.duo_root, 'run', 'duoauthproxy.pid')
+
+    @property
+    def tapfile(self):
+        return os.path.join(self.duo_root, 'bin', 'duoauthproxy.tap')
+
+    @property
+    def twistd_path(self):
+        return os.path.join(self.python_root, 'bin', 'twistd')
+
+    @property
+    def conn_tool_path(self):
+        return os.path.join(self.duo_root, 'bin', 'authproxy_connectivity_tool')
+
+    def _read_pidfile(self):
+        try:
+            with open(self.pidfile, 'r') as pidfile_fp:
+                pid = int(pidfile_fp.read())
+        except IOError:
+            # pidfile doesn't exist; return sentinel
+            return None
+        except ValueError:
+            raise ValueError('Invalid data in pidfile!')
+        return pid
+
+    def _is_running(self, pid):
+        # attempt to send a null signal to the process this won't
+        # actually send a signal, but will error out if the process is
+        # not running
+        try:
+            os.kill(pid, 0)
+            return True
+        except OSError:
+            return False
+
+    def _status(self):
+        try:
+            pid = self._read_pidfile()
+        except ValueError as e:
+            print(repr(e), file=sys.stderr)
+            return STATUS_UNKNOWN
+
+        if pid is None:
+            return STATUS_STOPPED
+        elif self._is_running(pid):
+            return STATUS_RUNNING
+        else:
+            return STATUS_STALE_PIDFILE
+
+    def start(self):
+        # do nothing if already running
+        if self._status() == STATUS_RUNNING:
+            return ERROR_NONE
+
+        return_code = self.run_connectivity_tool()
+        if return_code != 0:
+            # print >>sys.stderr, "Your configuration is not valid. The Duo Authentication Proxy failed to start"
+            # return ERROR_GENERIC
+
+            # We're choosing not to prevent auth proxy startup if there are
+            # config errors for now, but once the configuration validation
+            # proves to be stable we can go back to preventing startup.
+            print("Your configuration is not valid. Check the validation output for errors.", file=sys.stderr)
+
+        # build up twistd args
+        twistd_args = [self.twistd_path,
+                       '--pidfile=%s' % self.pidfile,
+                       '--python=%s' % self.tapfile]
+        if self.uid is not None and self.gid is not None:
+            twistd_args.extend([
+                '--uid=%s' % self.uid,
+                '--gid=%s' % self.gid,
+            ])
+        # run twistd
+        tool_message = 'If the duoauthproxy failed to start for connectivity reasons, ' \
+                       'the connectivity tool located at %s can be run independently to test for ' \
+                       'connectivity problems.' % self.conn_tool_path
+        try:
+            exit_status = subprocess.call(twistd_args)
+        except OSError as e:
+            print('Failed to start duoauthproxy: %s' % e, file=sys.stderr)
+            print(tool_message, file=sys.stderr)
+            return ERROR_GENERIC
+        if exit_status:
+            print('Failed to start duoauthproxy: exit status %d'
+                  % (exit_status), file=sys.stderr)
+            print(tool_message, file=sys.stderr)
+            return ERROR_GENERIC
+
+    def stop(self):
+        if self._status() == STATUS_RUNNING:
+            pid = self._read_pidfile()
+
+            # if pidfile exists, attempt to kill the process
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError as e:
+                print('Failed to stop duoauthproxy: %s' % e, file=sys.stderr)
+                return ERROR_GENERIC
+        return 0
+
+    def restart(self):
+        status = self.stop()
+        if status:
+            return status
+        time.sleep(1)
+        return self.start()
+
+    def status(self):
+        status = self._status()
+        if status == STATUS_RUNNING:
+            pid = self._read_pidfile()
+            print('duoauthproxy (pid %d) is running' % pid, file=sys.stderr)
+        elif status == STATUS_STALE_PIDFILE:
+            print('duoauthproxy is not running', file=sys.stderr)
+        elif status == STATUS_STOPPED:
+            print('duoauthproxy is not running', file=sys.stderr)
+        elif status == STATUS_UNKNOWN:
+            print('duoauthproxy status unknown!', file=sys.stderr)
+        return status
+
+    def version(self):
+        version = proxy.get_version()
+        print('Duo Security Authentication Proxy', file=sys.stderr, end=" ")
+        if version:
+            print(version, file=sys.stderr)
+        else:
+            print('- Unknown Version', file=sys.stderr)
+
+    def run_connectivity_tool(self):
+        try:
+            return subprocess.call([self.conn_tool_path, '--no-explicit-connectivity-check', '--startup'])
+        except OSError as e:
+            print('Failed to run authproxy connectivity tool: %s' % e, file=sys.stderr)
+            return 0
+
+
+def usage(argv):
+    print('Usage: %s {start|stop|restart|status|version}' % argv[0])
+
+
+def main(argv):
+    if len(argv) != 2:
+        usage(argv)
+        return ERROR_ARGS
+
+    proxy_ctl = AuthproxyController()
+
+    command = argv[1]
+    if command == 'start':
+        return proxy_ctl.start()
+    elif command == 'stop':
+        return proxy_ctl.stop()
+    elif command == 'restart':
+        return proxy_ctl.restart()
+    elif command == 'status':
+        return proxy_ctl.status()
+    elif command == 'version':
+        return proxy_ctl.version()
+    else:
+        usage(argv)
+        return ERROR_UNIMPLEMENTED
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv))

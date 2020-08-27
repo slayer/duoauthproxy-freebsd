@@ -1,0 +1,29 @@
+include ../../pkgs.mk
+
+# This is a temporary installation location which will be used by
+# Openssl-fips Makefile to store the FIPS object module. This Makefile
+# (Openssl-1.0.2o) will include the FIPS object module into the Openssl library.
+FIPS_DIST=$(CURDIR)/../$(OPENSSLFIPS_VER)/dist
+
+CFLAGS = -O2 -Wall -fstack-protector --param=ssp-buffer-size=4 -D_FORTIFY_SOURCE=2 -fomit-frame-pointer -fPIE
+LDFLAGS = -pie -Wl,-z,relro -Wl,-z,now
+
+.PHONY: all openssl test clean distclean
+
+all: Makefile
+
+Makefile:
+	mkdir -p "$(INSTALL_DIR)/usr/local/openssl"
+	CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" FIPSDIR="$(FIPS_DIST)" \
+	./config --openssldir="$(INSTALL_DIR)/usr/local/openssl" fips shared no-ssl2 no-comp no-idea 
+
+install: Makefile
+	$(MAKE) depend
+	$(MAKE) install
+
+clean:
+	rm -rf $(INSTALL_DIR)/usr/local/openssl
+	$(MAKE) distclean
+
+distclean:
+	rm -f Makefile

@@ -1,0 +1,9 @@
+#
+# Copyright (c) 2013 Duo Security
+# All Rights Reserved
+#
+
+
+ENCRYPT_PLAIN = 0
+ENCRYPT_AES256CFB = 1
+ENCRYPT_TYPES = set((ENCRYPT_PLAIN, ENCRYPT_AES256CFB))

@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Transitional//EN"
+    "http://www.w3.org/TR/xhtml1/DTD/xhtml1-transitional.dtd">
+
+<html xmlns="http://www.w3.org/1999/xhtml"
+      xmlns:nevow="http://nevow.com/ns/nevow/0.1">
+  <head>
+    <title>Address book search</title>
+    <link href="/form_css" rel="stylesheet" />
+  </head>
+  <body>
+    <h1>Address book search</h1>
+
+    <form nevow:render="input" action="post">
+      <p nevow:render="Remove">Search form will be here.</p>
+    </form>
+
+    <div nevow:render="haveSearch" nevow:data="search">
+      <p nevow:pattern="False">No search given.</p>
+      <div nevow:pattern="True">
+	<div nevow:render="sequence" nevow:data="results">
+	  <p nevow:pattern="empty">No entries found.</p>
+	  <pre nevow:pattern="item" nevow:render="string">
+	    LDIF output goes here.
+	  </pre>
+	</div>
+	<p>
+	  Used search filter:
+	  <span nevow:render="searchFilter" nevow:data="searchFilter"/>
+	</p>
+      </div>
+    </div>
+  </body>
+</html>

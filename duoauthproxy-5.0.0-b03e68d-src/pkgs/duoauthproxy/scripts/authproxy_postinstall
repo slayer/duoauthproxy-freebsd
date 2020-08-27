@@ -1,0 +1,70 @@
+#!/usr/bin/env python
+# encoding: utf-8
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+
+import argparse
+import os
+import sys
+from enum import Enum
+from pathlib import Path
+from shutil import copy2
+
+NEW_PROGRAM_FILES_PREFIX = Path(os.getenv("programfiles", ""))
+NEW_INSTALL_DIR = NEW_PROGRAM_FILES_PREFIX / "Duo Security Authentication Proxy"
+NEW_CONFIG_DIR = NEW_INSTALL_DIR / "conf"
+NEW_CONFIG_PATH = NEW_CONFIG_DIR / "authproxy.cfg"
+
+BACKUP_CONFIG_PATH = NEW_CONFIG_DIR / "previous_authproxy.cfg"
+OLD_PROGRAM_FILES_PREFIX = Path(os.getenv("programfiles(x86)", ""))
+OLD_INSTALL_DIR = OLD_PROGRAM_FILES_PREFIX / "Duo Security Authentication Proxy"
+
+
+class Mode(Enum):
+    migrate_32_bit_paths = "migrate_32_bit_paths"
+
+    def __str__(self):
+        return self.value
+
+
+def migrate_32_bit_paths(dry_run=False):
+    if not dry_run:
+        copy2(NEW_CONFIG_PATH, BACKUP_CONFIG_PATH)
+
+    with open(NEW_CONFIG_PATH, "r") as fh:
+        original_config_data = fh.read()
+
+    modified_config_data = original_config_data.replace(
+        str(OLD_INSTALL_DIR), str(NEW_INSTALL_DIR)
+    )
+
+    if modified_config_data == original_config_data:
+        return 0
+    else:
+        if not dry_run:
+            with open(NEW_CONFIG_PATH, "w") as fh:
+                fh.write(modified_config_data)
+
+        return 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="A collection of post install utilities for the Duo Security Authentication Proxy"
+    )
+    parser.add_argument("--check", action="store_true")
+    parser.add_argument("--mode", type=Mode, choices=list(Mode))
+    args = parser.parse_args()
+    mode = str(args.mode)
+
+    if mode in globals():
+        try:
+            result = globals()[mode](args.check)
+            sys.exit(result)
+        except Exception as e:
+            print(e)
+            sys.exit(2)
+    else:
+        sys.exit(5)

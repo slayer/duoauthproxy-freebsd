@@ -1,0 +1,189 @@
+#!/root/duoauthproxy-5.0.0-b03e68d-src/duoauthproxy-build/usr/local/bin/python3
+from __future__ import print_function
+
+import argparse
+import os
+import platform
+import sys
+import time
+from subprocess import (
+    DEVNULL,
+    CalledProcessError,
+    Popen,
+    call,
+    check_call,
+    check_output,
+)
+
+GRACE_PERIOD = 5
+
+usage = """
+    This script starts the authproxy in a special bypass mode which bypasses 2FA
+    for a given number of minutes (default 60 minutes).
+
+"""
+
+
+def in_script_directory(path):
+    script_directory = os.path.abspath(os.path.dirname(sys.argv[0]))
+    return os.path.join(script_directory, path)
+
+
+def stop_authproxy():
+    if platform.system() == "Windows":
+        call(["net", "stop", "duoauthproxy"])
+    else:
+        call([in_script_directory("authproxyctl"), "stop"])
+
+
+def start_authproxy():
+    if platform.system() == "Windows":
+        call(["net", "start", "duoauthproxy"])
+    else:
+        call([in_script_directory("authproxyctl"), "start"])
+
+
+def is_authproxy_daemon_running():
+    if platform.system() == "Windows":
+        return call(["sc", "query", "DuoAuthProxy"]) == 0
+    else:
+        try:
+            check_output([in_script_directory("authproxyctl"), "status"])
+            return True
+        except CalledProcessError:
+            return False
+
+
+def exit(code):
+    if platform.system() == "Windows" and not args.non_interactive:
+        input("Press Enter to continue...")
+
+    sys.exit(code)
+
+
+def get_bypass_process_kwargs():
+    """ Returns the arguments for Popen which will allow the child process to
+    continue running even after the parent is dead.
+
+    Windows: We just set a creation flag and the OS will handle the rest. If we
+    spawn the process as detached windows won't reap it with the parent.
+
+    Unix: We need to be a bit more manual and place the process in it's own group.
+    This is accomplished by calling `os.setpgrp` at the beginning of the process.
+    In this case we can just put that in a pre-exec function.
+
+    Close FDs: This just closes stdin/stdout on the child process os that it never
+    gets errors from writing to a socket which suddenly clsoes if the parent
+    terminated.
+    """
+    DETACHED_PROCESS = 8
+    bypass_proxy_kwargs = {
+        "close_fds": True,
+    }
+
+    if platform.system() != "Windows":
+        bypass_proxy_kwargs["preexec_fn"] = os.setpgrp
+    else:
+        bypass_proxy_kwargs["creationflags"] = DETACHED_PROCESS
+
+    return bypass_proxy_kwargs
+
+
+parser = argparse.ArgumentParser(description=usage)
+parser.add_argument(
+    "-t",
+    "--expiration-time",
+    type=int,
+    required=False,
+    default=60,
+    help="Time (in minutes) for the authproxy to remain in bypass mode before shutting down",
+)
+
+parser.add_argument(
+    "--non-interactive",
+    action="store_true",
+    help='Disables prompting for "Enter" at the end of running authproxy_primary_only on windows',
+)
+
+args = parser.parse_args()
+
+if args.expiration_time > 240:
+    print("Bypass mode must be set for no more than 4 hours")
+    exit(2)
+
+expiration = repr(args.expiration_time)
+authproxy_running_at_start = is_authproxy_daemon_running()
+
+# this will thrown an unhandled exception in the event of a non-zero exit code
+try:
+    check_call([in_script_directory("authproxy_connectivity_tool")])
+except CalledProcessError as e:
+    print("Problem validating config. Not attempting to stop running proxy.")
+    print("Could not enable primary-only mode.")
+    exit(e.returncode)
+
+bypass_proxy = None
+try:
+    if authproxy_running_at_start:
+        stop_authproxy()
+
+    bypass_proxy = Popen(
+        [in_script_directory("authproxy"), "--primary-only", expiration],
+        stdout=DEVNULL,
+        stderr=DEVNULL,
+        **get_bypass_process_kwargs()
+    )
+    time.sleep(GRACE_PERIOD)
+
+    # It should be running at this point
+    if bypass_proxy.poll():
+        raise Exception("Failed to start the authproxy.")
+
+    print("Authproxy running in bypass mode...")
+    print(
+        "If you close this window you will need to restart your authproxy manually in {0} minutes".format(
+            expiration
+        )
+    )
+
+    # sleep a little longer to let the authproxy close itself gracefully
+    time.sleep(int(expiration) * 60 + GRACE_PERIOD)
+
+    # We're being extra careful to not leave this running
+    if not bypass_proxy.poll():
+        stop_authproxy()
+        if not bypass_proxy.poll():
+            # proxy hasn't terinated nicely
+            bypass_proxy.terminate()
+
+    bypass_proxy = None
+
+except Exception as e:
+    print(e)
+
+finally:
+    if bypass_proxy:
+        try:
+            bypass_proxy.terminate()
+        except Exception:
+            pass
+
+    start_authproxy()
+    start_time = time.time()
+    daemon_started = False
+    while time.time() - start_time < GRACE_PERIOD and not daemon_started:
+        daemon_started = is_authproxy_daemon_running()
+        time.sleep(1)
+
+    time.sleep(GRACE_PERIOD)
+    exit_code = 0
+    if not daemon_started:
+        print(
+            "!!!!! ERROR YOUR AUTHPROXY IS NOT RUNNING PLEASE CHECK YOUR CONFIG AND RESTART THE PROXY MANUALLY !!!!!"
+        )
+        exit_code = 1
+    else:
+        print("Authproxy restored to normal 2FA configuration.")
+        exit_code = 0
+
+    exit(exit_code)

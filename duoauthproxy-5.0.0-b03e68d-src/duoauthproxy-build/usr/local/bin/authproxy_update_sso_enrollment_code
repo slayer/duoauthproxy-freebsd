@@ -1,0 +1,65 @@
+#!/root/duoauthproxy-5.0.0-b03e68d-src/duoauthproxy-build/usr/local/bin/python3
+import base64
+import json
+import os
+import sys
+from argparse import ArgumentParser
+
+from twisted.logger import globalLogPublisher, textFileLogObserver
+
+from duoauthproxy.lib import const, log, util
+from duoauthproxy.lib.secret_storage import get_storage_filename, store_secret
+
+# --- install script will customize this ---
+USER_DEFAULT = None
+# ------------------------------------------
+
+
+def set_linux_permissions():
+    import pwd
+    import stat
+
+    secret_storage_filename = get_storage_filename()
+    service_user_uid = pwd.getpwnam(USER_DEFAULT).pw_uid
+    os.lchown(secret_storage_filename, service_user_uid, 0)
+    directory = os.path.dirname(secret_storage_filename)
+    directory_permissions = os.stat(directory)
+    os.chmod(directory, directory_permissions.st_mode | stat.S_IXOTH)
+
+
+def main():
+    # Set the logger to output to stdout and ready the logger
+    stdout_observer = textFileLogObserver(sys.stdout)
+    globalLogPublisher.addObserver(stdout_observer)
+    log.ready()
+
+    parser = ArgumentParser()
+    parser.add_argument("enroll_code")
+    options = parser.parse_args()
+    home_dir = util.get_home_dir()
+    os.chdir(home_dir)
+
+    try:
+        secrets = json.loads(base64.standard_b64decode(options.enroll_code))
+
+        store_secret(const.DRPC_PROXY_KEY_IDENTIFIER, secrets["proxy_key"])
+        store_secret(const.DRPC_API_HOST_IDENTIFIER, secrets["api_host"])
+        store_secret(const.DRPC_SIGNING_SKEY_IDENTIFIER, secrets["signing_skey"])
+        store_secret(const.DRPC_ENCRYPTION_SKEY_IDENTIFIER, secrets["encryption_skey"])
+
+        # If the installer set USER_DEFAULT to a non-None value (which will
+        # only the case for Linux), set the owner of the secret storage file
+        # to that user. This allows the auth proxy to write to the file when
+        # rotating secrets.
+        if USER_DEFAULT:
+            set_linux_permissions()
+
+        print("All secrets stored successfully")
+        sys.exit(0)
+    except Exception as e:
+        print(e)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,11 @@
+prefix=/root/duoauthproxy-5.0.0-b03e68d-src/pkgs/openssl-fips-2.0.16/dist
+exec_prefix=${prefix}
+libdir=${exec_prefix}/lib
+includedir=${prefix}/include
+
+Name: OpenSSL
+Description: Secure Sockets Layer and cryptography libraries and tools
+Version: 1.1.0-dev
+Requires: 
+Libs: -L${libdir} -lssl -lcrypto 
+Cflags: -I${includedir} 

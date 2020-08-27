@@ -1,0 +1,4 @@
+Twisted
+pyparsing
+six>=1.7
+zope.interface

@@ -1,0 +1,93 @@
+#!/usr/bin/env python
+#
+# Copyright (c) 2011 Duo Security
+# All Rights Reserved
+#
+from __future__ import print_function
+import os
+import sys
+import argparse
+
+from twisted.internet import reactor
+from twisted.internet import defer
+from twisted.internet import task
+from twisted.logger import LogPublisher
+from twisted.logger import textFileLogObserver
+
+import colorama
+
+from duoauthproxy.lib import util
+from duoauthproxy.lib import config_provider
+from duoauthproxy.lib.config_error import ConfigError
+from duoauthproxy.lib.log import logger_container, CONN_LOGGER, LeanLogObserver
+from duoauthproxy.lib.validation import validator
+from duoauthproxy.proxy import create_log_file
+from duoauthproxy.lib import fips_manager
+
+
+@task.react
+@defer.inlineCallbacks
+def main(reactor):
+    parser = argparse.ArgumentParser(description='Duo Security Authentication Proxy Connectivity Troubleshooter. This tool will read your Authentication Proxy configuration file and test for any connectivity related issues')
+    parser.add_argument('--explicit-connectivity-check', dest='explicit_connectivity_check', action='store_true')
+    parser.add_argument('--no-explicit-connectivity-check', dest='explicit_connectivity_check', action='store_false')
+    parser.add_argument('--startup', action='store_true', help=argparse.SUPPRESS)  # used for checks run on startup
+    parser.set_defaults(explicit_connectivity_check=True)
+    args = parser.parse_args()
+
+    # Initialize colorama. This is needed by windows
+    colorama.init()
+
+    home_dir = util.get_home_dir()
+    os.chdir(home_dir)
+    try:
+        configuration = config_provider.get_config()
+    except ConfigError as e:
+        print("The follow configuration error is preventing the tool from running. Please resolve it and try again: \"{}\"".format(str(e)))
+        defer.returnValue('Done')
+
+    main_config = configuration.get_main_section_config()
+
+    fips_mode = main_config.get_bool('fips_mode', False)
+    if fips_mode:
+        fips_manager.enable()
+
+    log_dir = main_config.get_str('log_dir', 'log')
+    log_max_size = main_config.get_int('log_max_size', 10 * (1 << 20))
+    log_max_files = main_config.get_int('log_max_files', 6)
+    if log_max_files == 0:
+        # we need to pass None explicitly if we want there to be no limit
+        # 0 would just mean no logfiles would get kept...
+        log_max_files = None
+
+    log_filename = 'connectivity_tool.log'
+    log_file = create_log_file(log_filename, log_dir, log_max_size, log_max_files, None, None)
+    conn_log_file_observer = textFileLogObserver(log_file)
+    stdout_observer = LeanLogObserver(sys.stdout)
+
+    connectivity_publisher = LogPublisher()
+    connectivity_publisher.addObserver(conn_log_file_observer)
+    connectivity_publisher.addObserver(stdout_observer)
+    logger_container.add_logger(CONN_LOGGER, connectivity_publisher)
+    log = logger_container.get_logger(CONN_LOGGER)
+
+    # Only check the config for test_connectivity_on_startup if we're actually
+    # running this on startup as opposed to directly running the script
+    if (args.startup and main_config.get_bool('test_connectivity_on_startup', False)) or \
+       (not args.startup and args.explicit_connectivity_check):
+        print("Running The Duo Authentication Proxy Connectivity Tool. This may take several minutes...")
+        config_results, connectivity_results = yield validator.check_config_and_connectivity(configuration, log)
+        print("\nThe results have also been logged in {0}".format(os.path.join(home_dir, log_dir, log_filename)))
+    else:
+        print("Running a validation of your configuration...")
+        config_results = yield validator.check_config(configuration, log)
+        print("\nThe results have also been logged in {0}".format(os.path.join(home_dir, log_dir, log_filename)))
+
+    if not validator.all_sections_successful(config_results):
+        # Use lighter colors on windows as the normal green and red are too dark
+        util.set_stdout_color('red')
+        log.error("Configuration validation was not successful")
+        util.set_stdout_color('reset')
+        raise SystemExit(1)
+
+    defer.returnValue('Done')

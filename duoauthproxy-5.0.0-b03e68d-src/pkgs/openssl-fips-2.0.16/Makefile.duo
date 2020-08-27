@@ -1,0 +1,24 @@
+CFLAGS=-fPIE -O2 -Wall -fstack-protector --param=ssp-buffer-size=4 -D_FORTIFY_SOURCE=2 -fomit-frame-pointer
+LDFLAGS=-pie -Wl,-z,relro -Wl,-z,now
+
+# This is a temporary installation location which will be used by
+# Openssl-1.0.2. The Openssl library will then include the object file into
+# the Openssl library.
+INSTALLDIR=$(CURDIR)/dist
+
+.PHONY: all fips clean test install distclean
+
+all: Makefile
+
+Makefile:
+	mkdir -p $(INSTALLDIR)
+	CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" FIPSDIR="$(INSTALLDIR)" ./config
+
+install: Makefile
+	CFLAGS="$(CFLAGS)" LDFLAGS="$(LDFLAGS)" FIPSDIR="$(INSTALLDIR)" $(MAKE) install
+
+clean: distclean
+	rm -rf $(INSTALLDIR)
+
+distclean:
+	rm -f Makefile

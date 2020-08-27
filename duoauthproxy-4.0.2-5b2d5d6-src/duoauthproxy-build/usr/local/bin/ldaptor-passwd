@@ -1,0 +1,4 @@
+#!/root/duoauthproxy-4.0.2-5b2d5d6-src/duoauthproxy-build/usr/local/bin/python3
+# EASY-INSTALL-SCRIPT: 'ldaptor==19.1.0','ldaptor-passwd'
+__requires__ = 'ldaptor==19.1.0'
+__import__('pkg_resources').run_script('ldaptor==19.1.0', 'ldaptor-passwd')
